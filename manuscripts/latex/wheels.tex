@@ -1,0 +1,73 @@
+% Faithful LaTeX transcription of ../wheels.md.
+
+\documentclass[11pt,letterpaper]{article}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath}
+\usepackage{array,tabularx}
+\usepackage{xcolor}
+\usepackage[margin=.84in,top=.72in,bottom=.78in]{geometry}
+\definecolor{linkblue}{RGB}{28,77,122}
+\usepackage[colorlinks=true,allcolors=linkblue]{hyperref}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt plus 1pt}
+\setlength{\emergencystretch}{2em}
+\renewcommand{\arraystretch}{1.17}
+\raggedbottom
+
+\hypersetup{pdftitle={Deriving wheel metadata during byte-exact binary patching}}
+
+\begin{document}
+
+{\LARGE\bfseries\raggedright\hyphenpenalty=10000 Deriving wheel metadata during byte-exact binary patching\par}
+
+\section*{Abstract}
+
+Package updates must often recreate a published archive down to its last byte. Small edits can change an entire compressed member, and a wheel also records cryptographic hashes of the members that changed. We expose reproducible member bytes to a binary differencer and derive eligible RECORD hashes during reconstruction. On sixteen PyPI wheel pairs the complete patches totalled 431,406 bytes, a 51.43\% reduction from an archive-aware 888,127-byte baseline. Deriving RECORD fields saved 9,720 bytes beyond the preceding best recipes and reduced patch size for every project. A second encoding reproduced all sixteen patch hashes, and each decoded wheel matched the published bytes. \href{../../../manuscripts/runs/wheels.jsonl}{Confirmation journal} \textperiodcentered{} \href{../../../manuscripts/PROTOCOL.md}{Extension protocol}
+
+\section{Archive structure and prior work}
+
+Percival's bsdiff uses matches in the old file and compresses control, difference and literal streams. Google Archive Patcher makes compressed ZIP members amenable to differencing by expanding them and recording how to reproduce the target's compressed bytes. A Python wheel adds another source of redundancy. Its distribution metadata records member paths, digests and sizes. A change to the member yields a different digest even when the change to its contents is small. The published target still fixes every character of the RECORD and every byte of its DEFLATE stream. \href{https://www.daemonology.net/bsdiff/}{Percival} \textperiodcentered{} \href{https://github.com/google/archive-patcher}{Google Archive Patcher} \textperiodcentered{} \href{https://packaging.python.org/en/latest/specifications/binary-distribution-format/}{Wheel distribution specification}
+
+Our earlier compatible BSDIFF40 experiments changed the parse while retaining the existing decoder. An initial held-out comparison saved 0.0306\% of delivered bytes. The whole-wheel work uses a format-aware decoder that can reproduce the original archive. This changes the design space and the interoperability requirement. The two results measure different deliverables. \href{../../../paper/REPORT.md}{Original study} \textperiodcentered{} \href{../../../doubling/RESULTS.md}{Archive-format experiments}
+
+\section{Reconstructing a RECORD}
+
+The encoder looks for a unique top-level distribution RECORD and examines canonical unquoted SHA-256 rows. It requires an unambiguous member name, the recorded size, and a hash that matches the member's uncompressed bytes. It replaces each qualifying digest with an equal-length marker before generating the delta. Quoted names, unsupported digests and absent members retain their original representation. A pre-existing marker makes that RECORD ineligible.
+
+The decoder first reconstructs the ordinary members and the target ZIP structure. It reserves exactly the recorded compressed span for the deferred RECORD, preserving the offsets of every other entry. It reads target members in memory by name, restores their unpadded URL-safe base64 digests, and recompresses the RECORD using the recorded codec. It checks both compressed length and the final target SHA-256. Matching source-side normalization lets stable metadata remain cheap to encode. \href{../../../workhorses/delta_record.py}{RECORD transformation} \textperiodcentered{} \href{../../../workhorses/delta_wheel.py}{Patch preparation and application}
+
+\clearpage
+
+Other stages can expose independently added members, normalize supported AMD64 PE references, encode compact control streams, or make an already decoded target prefix available when decoding the remainder. The encoder checks reproducibility before using a DEFLATE recipe. The delivered size includes the wrapper, hashes, metadata and every compressed delta stream. \href{https://learn.microsoft.com/en-us/windows/win32/debug/pe-format}{PE format} \textperiodcentered{} \href{../../../twice/RESULTS.md}{Previous recipe comparison}
+
+\section{Evaluation}
+
+We use sixteen public PyPI release pairs frozen by filename, release, compatibility tag and SHA-256. The cohort includes platform-independent Python wheels and Windows native wheels. The denominator is the sum of delivered bytes across the entire cohort, so larger packages have more weight. The original control already used archive-aware delta selection. The latest ablation reproduces the previous winning recipe and patch hash for each project, toggles RECORD normalization, retains the smaller complete patch, then regenerates and decodes the winner a second time. Byte equality to the published target is the acceptance criterion. \href{../../../followup/inputs-delta.json}{Input manifest} \textperiodcentered{} \href{../../../benchmarks/record_wheels.py}{Ablation and confirmation code}
+
+\section{Results and open questions}
+
+Archive normalization and XZ first brought the control total to 611,442 bytes. Independent expansion and the subsequent size sweep reached 441,126 bytes, including 16,727 for setuptools and 157,400 for zstandard. The earlier timed selector delivered 464,911 bytes and had median encode and decode times of 9.55\(\times\) and 1.15\(\times\) those of the control. Those timings apply to that selector. The final size sweep and RECORD ablation have their own verified byte totals. \href{../../../twice/summary.json}{Size and timing evidence}
+
+\par\smallskip
+\begingroup\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}X>{\centering\arraybackslash}p{1.11in}>{\centering\arraybackslash}p{1.32in}>{\centering\arraybackslash}p{0.86in}}
+\hline
+\textbf{Whole-wheel patch} & \textbf{Previous bytes} & \textbf{With derived RECORD} & \textbf{Bytes saved} \\
+\hline
+setuptools & 16,727 & 14,134 & 2,593 \\
+markdown-it-py & 7,744 & 5,704 & 2,040 \\
+lxml & 69,665 & 68,914 & 751 \\
+zstandard & 157,400 & 157,101 & 299 \\
+All 16 projects & 441,126 & 431,406 & 9,720 \\
+\hline
+\end{tabularx}
+\endgroup
+\par\smallskip
+
+The largest two absolute reductions came from setuptools and markdown-it-py. The largest previous patch, zstandard, saved only 299 more bytes. The 2.20\% aggregate reduction measures the benefit of RECORD reconstruction with the prior recipes fixed. Regenerating the original sixteen controls also reproduced their published target wheels and their 888,127-byte total. The size experiment leaves the wall-time cost of hashing and recompression open. \href{../../../manuscripts/summary.json}{All sixteen results} \textperiodcentered{} \href{../../../manuscripts/runs/wheel-original.jsonl}{Original control confirmation}
+
+The ability to derive metadata depends on archive conventions and exact recompression. The 16 development projects offer limited coverage of codecs, platforms and release histories. Distribution at scale also depends on encoder time, decoder memory and codec availability. A fresh project cohort with fixed recipes and measured resource use would support a deployment claim.
+
+\end{document}
