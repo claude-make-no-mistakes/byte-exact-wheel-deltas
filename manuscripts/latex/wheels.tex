@@ -1,73 +1,232 @@
-% Faithful LaTeX transcription of ../wheels.md.
+\documentclass[10pt,letterpaper]{article}
 
-\documentclass[11pt,letterpaper]{article}
+\usepackage[margin=0.9in]{geometry}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
-\usepackage{amsmath}
-\usepackage{array,tabularx}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
 \usepackage{xcolor}
-\usepackage[margin=.84in,top=.72in,bottom=.78in]{geometry}
-\definecolor{linkblue}{RGB}{28,77,122}
 \usepackage[colorlinks=true,allcolors=linkblue]{hyperref}
-\setlength{\parindent}{0pt}
-\setlength{\parskip}{5pt plus 1pt}
-\setlength{\emergencystretch}{2em}
-\renewcommand{\arraystretch}{1.17}
-\raggedbottom
 
-\hypersetup{pdftitle={Deriving wheel metadata during byte-exact binary patching}}
+\definecolor{linkblue}{RGB}{24,74,122}
+
+\newtheorem{proposition}{Proposition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\hypersetup{
+  pdftitle={Deriving Wheel Metadata During Byte-Exact Binary Patching},
+  pdfsubject={Archive-aware binary delta encoding for Python wheel distributions}
+}
 
 \begin{document}
 
-{\LARGE\bfseries\raggedright\hyphenpenalty=10000 Deriving wheel metadata during byte-exact binary patching\par}
+\begin{center}
+{\Large\bfseries Deriving Wheel Metadata During Byte-Exact Binary Patching\par}
+\end{center}
+\vspace{0.5em}
 
-\section*{Abstract}
+\begin{abstract}
+Package distribution pipelines frequently require reconstructing a published archive down to its final byte so that cryptographic signatures and repository checksums remain valid. In ZIP-based archives, small source edits perturb entire compressed DEFLATE bitstreams, and Python wheels introduce a second layer of cascading entropy because their \texttt{RECORD} metadata lists cryptographic SHA-256 digests of every modified member. We combine reproducible archive-member expansion with deferred, in-memory derivation of eligible \texttt{RECORD} digests during patch application, and we establish the span-preservation and byte-exactness invariants of the two-pass decoder. Across sixteen frozen PyPI wheel release pairs spanning platform-independent Python and Windows \texttt{amd64} native packages, complete self-contained patches total 431,406 bytes---a 51.43\% reduction from an 888,127-byte archive-aware baseline (and a 91.62\% reduction from 5,148,312 bytes of archive-unaware BSDIFF40 deltas). Deriving \texttt{RECORD} digests saves 9,720 bytes (2.20\%) beyond the preceding 441,126-byte best recipes and reduces patch size for every project in the cohort. A second encoding reproduces all sixteen winning patch SHA-256 digests identically, and every decoded wheel matches its published PyPI bytes exactly.
+\end{abstract}
 
-Package updates must often recreate a published archive down to its last byte. Small edits can change an entire compressed member, and a wheel also records cryptographic hashes of the members that changed. We expose reproducible member bytes to a binary differencer and derive eligible RECORD hashes during reconstruction. On sixteen PyPI wheel pairs the complete patches totalled 431,406 bytes, a 51.43\% reduction from an archive-aware 888,127-byte baseline. Deriving RECORD fields saved 9,720 bytes beyond the preceding best recipes and reduced patch size for every project. A second encoding reproduced all sixteen patch hashes, and each decoded wheel matched the published bytes. \href{../../../manuscripts/runs/wheels.jsonl}{Confirmation journal} \textperiodcentered{} \href{../../../manuscripts/PROTOCOL.md}{Extension protocol}
+\section{Archive Structure and Prior Work}
+\label{sec:prior}
 
-\section{Archive structure and prior work}
+Binary differencing algorithms such as Percival's \texttt{bsdiff} \cite{percival2003bsdiff} exploit approximate matches between an old file and a target file, emitting compressed control, bytewise difference, and literal streams in the BSDIFF40 wire format. When applied directly to compressed archives, however, even a localized edit to one uncompressed member alters its compressed DEFLATE bitstream \cite{rfc1951} from the point of modification onward, destroying byte-level correspondence between releases. Google Archive Patcher \cite{archivepatcher} addresses this obstacle for ZIP archives by expanding reproducible compressed members prior to differencing and recording per-member recompression parameters so the decoder can reconstruct the exact published archive bytes.
 
-Percival's bsdiff uses matches in the old file and compresses control, difference and literal streams. Google Archive Patcher makes compressed ZIP members amenable to differencing by expanding them and recording how to reproduce the target's compressed bytes. A Python wheel adds another source of redundancy. Its distribution metadata records member paths, digests and sizes. A change to the member yields a different digest even when the change to its contents is small. The published target still fixes every character of the RECORD and every byte of its DEFLATE stream. \href{https://www.daemonology.net/bsdiff/}{Percival} \textperiodcentered{} \href{https://github.com/google/archive-patcher}{Google Archive Patcher} \textperiodcentered{} \href{https://packaging.python.org/en/latest/specifications/binary-distribution-format/}{Wheel distribution specification}
+Python binary distributions (\emph{wheels}, specified by PEP~427 \cite{pep427}) add a second, format-specific source of incompressible churn. Each wheel contains a top-level metadata file \texttt{<dist>.dist-info/RECORD} listing member paths, unpadded URL-safe base64-encoded SHA-256 digests (43~ASCII characters per digest), and uncompressed byte lengths. Whenever any member changes---even by a single byte---its cryptographic digest in \texttt{RECORD} becomes statistically indistinguishable from uniform random characters. Because byte-exact distribution fixes every character of \texttt{RECORD} and every byte of its DEFLATE stream, a generic binary differencer must transmit those pseudorandom digest bytes even though the decoder already possesses the reconstructed member bytes from which every digest is uniquely determined.
 
-Our earlier compatible BSDIFF40 experiments changed the parse while retaining the existing decoder. An initial held-out comparison saved 0.0306\% of delivered bytes. The whole-wheel work uses a format-aware decoder that can reproduce the original archive. This changes the design space and the interoperability requirement. The two results measure different deliverables. \href{../../../paper/REPORT.md}{Original study} \textperiodcentered{} \href{../../../doubling/RESULTS.md}{Archive-format experiments}
+Our earlier compatible BSDIFF40 experiments retained the stock \texttt{bspatch} decoder and sought size reductions strictly by remapping duplicate source offsets and shifting copy/literal boundaries within an existing parse. On a held-out cohort of 48 wheel and shared-member pairs, that postprocessor saved 2,245 of 7,347,524 delivered bytes (0.0306\%), constrained by the 2.45\% aggregate share of compressed control bytes. Allowing a format-aware decoder capable of exact ZIP recompression and metadata derivation alters both the design space and the interoperability contract; accordingly, the two studies measure distinct deliverables.
 
-\section{Reconstructing a RECORD}
+\section{Format-Aware Normalization and Deferred \texttt{RECORD} Reconstruction}
+\label{sec:method}
 
-The encoder looks for a unique top-level distribution RECORD and examines canonical unquoted SHA-256 rows. It requires an unambiguous member name, the recorded size, and a hash that matches the member's uncompressed bytes. It replaces each qualifying digest with an equal-length marker before generating the delta. Quoted names, unsupported digests and absent members retain their original representation. A pre-existing marker makes that RECORD ineligible.
+\subsection{Archive Normalization and Auxiliary Stages}
+\label{sec:stages}
 
-The decoder first reconstructs the ordinary members and the target ZIP structure. It reserves exactly the recorded compressed span for the deferred RECORD, preserving the offsets of every other entry. It reads target members in memory by name, restores their unpadded URL-safe base64 digests, and recompresses the RECORD using the recorded codec. It checks both compressed length and the final target SHA-256. Matching source-side normalization lets stable metadata remain cheap to encode. \href{../../../workhorses/delta_record.py}{RECORD transformation} \textperiodcentered{} \href{../../../workhorses/delta_wheel.py}{Patch preparation and application}
+Given a source archive $S$ and target archive $A$ (each bounded by 64~MiB), the encoder parses both ZIP directories and selects non-overlapping, unencrypted \texttt{ZIP\_DEFLATED} members with unique filenames and uncompressed lengths above a configurable threshold (e.g., 32, 128, or 1,024~bytes, up to 4,096 members). Unlike an intersection-only pass, independent expansion also exposes newly added or renamed target members and removed source members so that cross-member similarities remain visible to the binary differencer. Before admitting any target member $M_j$ with compressed payload $C_j$, the encoder checks exact byte-for-byte reproducibility against deterministic DEFLATE implementations: \texttt{zlib} \cite{zlib} (levels~1--9) and, when enabled, \texttt{miniz\_oxide}~0.8.2 \cite{minizoxide} (levels~1--9). Only members reproduced identically by a recorded codec and level are expanded, and the exact runtime version string is stored in the recipe metadata so any codec mismatch is rejected prior to decoding.
 
-\clearpage
+Three auxiliary format-aware stages compose with archive expansion inside the \texttt{WDP3} container:
+\begin{enumerate}
+  \item \emph{Reversible AMD64 PE normalization.} For Windows native extensions (\texttt{.pyd}/\texttt{.dll}, $\ge 64$~KiB) containing a valid PE32+ \texttt{.pdata} exception directory \cite{peformat}, the encoder differentially encodes the 12-byte function-table triples $(\text{BeginAddress}, \text{EndAddress}, \text{UnwindInfoAddress})$ modulo $2^{32}$. Optional modes additionally canonicalize 32-bit relative \texttt{CALL}/\texttt{JMP} displacements and RIP-relative \texttt{.rdata} operands to unique 32-bit function or 12-byte data-window hashes, recording a compact bitmask of rewritten sites in the recipe hints so the inverse transform is an exact bijection.
+  \item \emph{Compact inner delta encodings.} Validated BSDIFF40 parses may be re-encoded using LZMA2/XZ streams \cite{xzformat} (\texttt{BSDXZ001}) or with zigzag variable-width control tuples (\texttt{BSDXZ002}), or with decoded-context literal streams (\texttt{CTXD0001}) that encode literal bytes against the concatenation of the source and already-recovered difference bytes.
+  \item \emph{Two-chunk prefix chaining.} When a normalized target contains an internal PE boundary, a \texttt{PFXD0001} payload splits the target into two chunks (in forward or reverse order) and encodes the second chunk against the concatenation of the normalized source and the reconstructed first chunk.
+\end{enumerate}
 
-Other stages can expose independently added members, normalize supported AMD64 PE references, encode compact control streams, or make an already decoded target prefix available when decoding the remainder. The encoder checks reproducibility before using a DEFLATE recipe. The delivered size includes the wrapper, hashes, metadata and every compressed delta stream. \href{https://learn.microsoft.com/en-us/windows/win32/debug/pe-format}{PE format} \textperiodcentered{} \href{../../../twice/RESULTS.md}{Previous recipe comparison}
+\subsection{Canonical \texttt{RECORD} Masking and Deferred Decoding}
+\label{sec:record}
 
-\section{Evaluation}
+When \texttt{RECORD} derivation is enabled, the encoder identifies a unique top-level distribution metadata entry matching \texttt{<name>.dist-info/RECORD} whose uncompressed size is at most 4~MiB, whose DEFLATE bitstream is reproducible by the recorded codec, and whose contents do not already contain the 43-byte marker $m = \texttt{!}^{43}$. Because `\texttt{!}' lies outside the URL-safe base64 alphabet \texttt{[A-Za-z0-9\_-]}, the marker cannot collide with any valid unpadded SHA-256 digest (which has fixed length $\lceil 256/6 \rceil = 43$ bytes).
 
-We use sixteen public PyPI release pairs frozen by filename, release, compatibility tag and SHA-256. The cohort includes platform-independent Python wheels and Windows native wheels. The denominator is the sum of delivered bytes across the entire cohort, so larger packages have more weight. The original control already used archive-aware delta selection. The latest ablation reproduces the previous winning recipe and patch hash for each project, toggles RECORD normalization, retains the smaller complete patch, then regenerates and decodes the winner a second time. Byte equality to the published target is the acceptance criterion. \href{../../../followup/inputs-delta.json}{Input manifest} \textperiodcentered{} \href{../../../benchmarks/record_wheels.py}{Ablation and confirmation code}
+The encoder scans canonical unquoted CSV rows of the form
+\[
+  \texttt{path,sha256=}\langle d \rangle\texttt{,}\langle s \rangle
+\]
+terminated by LF or CRLF, where \texttt{path} is a valid UTF-8 filename containing no comma, quote, NUL, or newline, $\langle d \rangle$ is a 43-character base64url digest, and $\langle s \rangle$ is a decimal length of at most 10~digits. A row qualifies if and only if: (i)~\texttt{path} names a unique, unencrypted, non-\texttt{RECORD} member in the archive stored with \texttt{ZIP\_STORED} or \texttt{ZIP\_DEFLATED}; (ii)~its uncompressed ZIP size equals $\langle s \rangle$; and (iii)~the SHA-256 digest of its uncompressed bytes equals $\langle d \rangle$. Every qualifying digest $\langle d \rangle$ is replaced in place by $m = \texttt{!}^{43}$, preserving both the row's line ending and the exact byte length of \texttt{RECORD}. Quoted paths, unsupported or mismatched digests, absent members, and the self-referential \texttt{RECORD} row remain verbatim. Applying the same masking transformation to the source wheel's \texttt{RECORD} aligns unchanged member rows across releases so that the inner delta encodes them at near-zero residual cost.
 
-\section{Results and open questions}
+\subsection{Span-Preservation and Byte-Exactness Invariant}
+\label{sec:invariant}
 
-Archive normalization and XZ first brought the control total to 611,442 bytes. Independent expansion and the subsequent size sweep reached 441,126 bytes, including 16,727 for setuptools and 157,400 for zstandard. The earlier timed selector delivered 464,911 bytes and had median encode and decode times of 9.55\(\times\) and 1.15\(\times\) those of the control. Those timings apply to that selector. The final size sweep and RECORD ablation have their own verified byte totals. \href{../../../twice/summary.json}{Size and timing evidence}
+A potential subtlety arises when \texttt{RECORD} appears \emph{before} the members it hashes inside the target ZIP archive: the decoder cannot compute a member's SHA-256 digest until that member has been reconstructed, yet ZIP central-directory entries index local file headers by absolute byte offset. The decoder resolves this dependency in two passes by reserving the exact compressed length of \texttt{RECORD} during the first pass.
 
-\par\smallskip
-\begingroup\small
+\begin{proposition}[Span-preserving deferred reconstruction]
+\label{prop:exact}
+Let $A \in \{0,1\}^{8N}$ be a target ZIP archive with $k \ge 1$ non-overlapping, reproducible DEFLATE payload spans $(a_j, c_j, r_j)$ ordered by byte offset $0 \le a_1 < a_1 + c_1 \le \dots \le a_k + c_k \le N$, where $c_j > 0$ is the compressed length, $r_j > 0$ is the uncompressed length, $M_j$ is the uncompressed payload of member $j$, and deterministic codec $\mathcal{E}_{l_j}$ satisfies $\mathcal{E}_{l_j}(M_j) = A[a_j : a_j + c_j]$. Suppose each member undergoes a length-preserving transform $T_j : \{0,1\}^{8r_j} \to \{0,1\}^{8r_j}$ with flag $f_j \in \{0,1,2\}$ such that:
+\begin{itemize}
+  \item for $f_j \in \{0,1\}$, $T_j$ has an exact inverse $T_j^{-1}(\cdot, h_j)$ satisfying $T_j^{-1}(T_j(M_j), h_j) = M_j$;
+  \item at most one index $j^*$ has $f_{j^*} = 2$, corresponding to a unique top-level \texttt{RECORD} containing no pre-existing marker $m = \texttt{!}^{43}$, with $T_{j^*}(M_{j^*})$ masking only canonical rows whose hashes match the uncompressed bytes of distinct non-\texttt{RECORD} members of $A$.
+\end{itemize}
+Let $\widetilde{A}$ be the expanded stream formed by splicing $T_j(M_j)$ into $[a_j, a_j + c_j)$, in which member $j$ occupies offset $o_j = a_j + \sum_{i < j} (r_i - c_i)$ and length $r_j$. If the inner delta reconstructs $\widetilde{A}$ exactly, then the two-pass decoder reconstructs $A$ byte-for-byte.
+\end{proposition}
+
+\begin{proof}
+Because every transform $T_j$ preserves byte length ($|T_j(M_j)| = r_j$), splicing the $k$ spans in ascending offset order shifts the start of span $j$ from $a_j$ in $A$ to $o_j = a_j + \sum_{i < j}(r_i - c_i)$ in $\widetilde{A}$, while leaving every byte of $A$ outside $\bigcup_{j=1}^k [a_j, a_j + c_j)$ unchanged between consecutive spans.
+
+In Pass~1, the decoder iterates $j = 1, \dots, k$ in ascending order of $o_j$, tracking cumulative shift $\delta_j = \sum_{i < j}(c_i - r_i)$. For each $j$ with $f_j \in \{0,1\}$, it recovers $M_j = T_j^{-1}(\widetilde{A}[o_j : o_j + r_j], h_j)$ and recompresses $C_j = \mathcal{E}_{l_j}(M_j)$, which equals $A[a_j : a_j + c_j]$ and therefore has exact length $c_j$. If an index $j^*$ with $f_{j^*} = 2$ exists, Pass~1 records the target byte offset
+\[
+  o_{j^*} + \delta_{j^*} = a_{j^*} + \sum_{i < j^*}(r_i - c_i) + \sum_{i < j^*}(c_i - r_i) = a_{j^*},
+\]
+retains the masked buffer $\widetilde{M}_{j^*} = \widetilde{A}[o_{j^*} : o_{j^*} + r_{j^*}]$, and splices a zero-filled placeholder $0^{c_{j^*}}$ of exact length $c_{j^*}$ in place of $[o_{j^*}, o_{j^*} + r_{j^*})$. Because every replaced span $[o_j, o_j + r_j)$ is mapped back to length $c_j$, the resulting intermediate byte string $A'$ has total length $N$ and satisfies $A'[x] = A[x]$ for every byte index $x \notin [a_{j^*}, a_{j^*} + c_{j^*})$.
+
+In particular, the ZIP end-of-central-directory record, central directory, and every local file header and payload of every non-\texttt{RECORD} member in $A'$ occupy their exact offsets and contain their exact bytes from $A$---regardless of whether $a_{j^*}$ precedes or follows those members. In Pass~2, opening $A'$ as a ZIP archive verifies that the unique \texttt{RECORD} local payload begins at $a_{j^*}$, reads each referenced non-\texttt{RECORD} member in memory, and computes its exact uncompressed SHA-256 digest. Because $m \not\subset M_{j^*}$, the set of masked rows in $\widetilde{M}_{j^*}$ coincides identically with the set of rows masked during encoding, so replacing each $m$ by the recomputed 43-byte digest recovers $M_{j^*}$ verbatim and leaves zero remaining markers. Recompressing yields $\mathcal{E}_{l_{j^*}}(M_{j^*}) = A[a_{j^*} : a_{j^*} + c_{j^*}]$ of length $c_{j^*}$, and splicing it into $[a_{j^*}, a_{j^*} + c_{j^*})$ produces $A$ identically at all $N$ bytes.
+\end{proof}
+
+\begin{remark}
+Before executing either pass, the decoder checks the source archive's SHA-256 digest against the stored 32-byte source hash, verifies that all source and target spans are strictly non-overlapping and within memory budgets, confirms that at most one source and one target member carry flag~2, and enforces the recorded compressed lengths. After Pass~2, the decoder verifies that the reconstructed archive's SHA-256 digest matches the stored 32-byte target hash. Any discrepancy aborts decoding.
+\end{remark}
+
+\section{Experimental Evaluation}
+\label{sec:eval}
+
+We evaluate byte-exact wheel patching on sixteen public PyPI release pairs frozen by filename, release version, wheel compatibility tag, and SHA-256 digest. The cohort comprises seven platform-independent Python wheels (\texttt{py3-none-any} or \texttt{py2.py3-none-any}) and nine Windows native wheels (\texttt{cp312-cp312-win\_amd64}), totaling 7,033,845~source bytes and 7,053,346~target bytes.
+
+Every reported patch size accounts for the complete delivered artifact: outer container header, compressed recipe metadata, codec runtime tags, PE reference bitmaps, source and target SHA-256 hashes, and all compressed delta streams. The primary aggregate metric is the sum of delivered patch bytes across all sixteen projects, so larger packages carry proportionally greater weight. The acceptance criterion for every candidate and confirmed patch is exact byte equality to the published PyPI target wheel.
+
+Our archive-aware baseline (the original control) already selects per project between raw BSDIFF40 (\texttt{hdiffz -BSD}) and archive-normalized \texttt{ZIPD} deltas, reducing raw archive-unaware deltas from 5,148,312 bytes to 888,127 bytes. Subsequent rounds introduced \texttt{miniz\_oxide} codec support and XZ stream encoding (Round~1: 611,442 bytes), a timed multi-recipe selector (Round~2 timed: 464,911 bytes), and an expanded size sweep adding smaller member thresholds (32 and 128~bytes), compact variable-width controls, PE \texttt{.rdata} labels, and two-chunk prefix chaining (Round~2 size sweep: 441,126 bytes).
+
+The final \texttt{RECORD} ablation isolates the marginal effect of derived metadata with prior recipes held fixed. For each of the sixteen projects, the harness: (1)~re-encodes the preceding Round~2 winning recipe with \texttt{record\_hashes=False} and asserts exact equality of both byte length and patch SHA-256 digest against the archived confirmation; (2)~encodes the same recipe with \texttt{record\_hashes=True}; (3)~decodes both candidates from the source wheel and patch alone, verifying exact reconstruction of the target wheel; (4)~retains the smaller verified patch; and (5)~regenerates and decodes the winner a second time to verify deterministic patch hashing and byte-exact decoding.
+
+\section{Results and Discussion}
+\label{sec:results}
+
+Table~\ref{tab:progression} summarizes the cumulative progression of aggregate delivered patch bytes across all sixteen PyPI wheel pairs, and Table~\ref{tab:projects} reports the complete per-project breakdown.
+
+\begin{table}[htbp]
+\centering
+\caption{Aggregate delivered patch bytes across all 16 frozen PyPI wheel pairs (total target size 7,053,346~bytes). Reductions are computed relative to the 888,127-byte archive-aware control.}
+\label{tab:progression}
+\smallskip
+\small
 \setlength{\tabcolsep}{5pt}
-\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}X>{\centering\arraybackslash}p{1.11in}>{\centering\arraybackslash}p{1.32in}>{\centering\arraybackslash}p{0.86in}}
-\hline
-\textbf{Whole-wheel patch} & \textbf{Previous bytes} & \textbf{With derived RECORD} & \textbf{Bytes saved} \\
-\hline
-setuptools & 16,727 & 14,134 & 2,593 \\
-markdown-it-py & 7,744 & 5,704 & 2,040 \\
-lxml & 69,665 & 68,914 & 751 \\
-zstandard & 157,400 & 157,101 & 299 \\
-All 16 projects & 441,126 & 431,406 & 9,720 \\
-\hline
-\end{tabularx}
-\endgroup
-\par\smallskip
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+\textbf{Method / stage} & \textbf{Total bytes} & \textbf{vs.\ Control} & \textbf{Scope and timing notes} \\
+\midrule
+Raw BSDIFF40 (\texttt{hdiffz -BSD}) & 5,148,312 & $+479.68\%$ & Archive-unaware baseline \\
+Original archive-aware control (\texttt{ZIPD}) & 888,127 & $0.00\%$ & Verified control (re-confirmed) \\
+Round~1: archive + \texttt{miniz\_oxide} + XZ & 611,442 & $-31.15\%$ & Timed (4.74$\times$ enc., 0.95$\times$ dec.) \\
+Round~2: timed multi-recipe selector & 464,911 & $-47.65\%$ & Timed (9.55$\times$ enc., 1.15$\times$ dec.) \\
+Round~2: size sweep (\texttt{WDP3}, prior best) & 441,126 & $-50.33\%$ & Size-only (90 verified candidates) \\
+\textbf{With derived \texttt{RECORD} (this work)} & \textbf{431,406} & \textbf{$-51.43\%$} & \textbf{Size ablation ($-2.20\%$ vs.\ 441,126)} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-The largest two absolute reductions came from setuptools and markdown-it-py. The largest previous patch, zstandard, saved only 299 more bytes. The 2.20\% aggregate reduction measures the benefit of RECORD reconstruction with the prior recipes fixed. Regenerating the original sixteen controls also reproduced their published target wheels and their 888,127-byte total. The size experiment leaves the wall-time cost of hashing and recompression open. \href{../../../manuscripts/summary.json}{All sixteen results} \textperiodcentered{} \href{../../../manuscripts/runs/wheel-original.jsonl}{Original control confirmation}
+\begin{table}[htbp]
+\centering
+\caption{Per-project delivered patch bytes across all 16 PyPI wheel pairs, comparing the original archive-aware control, Round~1 (archive + XZ), the Round~2 size-sweep winner (\emph{Previous}), and the same recipe with derived \texttt{RECORD} digests. Every project improved, and a second encoding reproduced all 16 patch SHA-256 hashes identically.}
+\label{tab:projects}
+\smallskip
+\footnotesize
+\setlength{\tabcolsep}{4.8pt}
+\begin{tabular}{@{}llrrrrrrl@{}}
+\toprule
+\textbf{Project} & \textbf{Wheel class} & \textbf{Control} & \textbf{Round~1} & \textbf{Previous} & \textbf{Derived} & \textbf{Saved} & \textbf{Rel.\ \%} & \textbf{Recipe} \\
+\midrule
+\texttt{setuptools} & Pure Python & 75,348 & 73,475 & 16,727 & 14,134 & 2,593 & 15.50\% & \texttt{tiny} \\
+\texttt{wheel} & Pure Python & 3,764 & 3,287 & 880 & 746 & 134 & 15.23\% & \texttt{small} \\
+\texttt{certifi} & Pure Python & 2,681 & 2,355 & 1,079 & 867 & 212 & 19.65\% & \texttt{tiny} \\
+\texttt{charset-normalizer} & Win \texttt{amd64} & 28,952 & 25,557 & 14,007 & 13,577 & 430 & 3.07\% & \texttt{data-pe} \\
+\texttt{sniffio} & Pure Python & 3,304 & 2,928 & 1,367 & 1,151 & 216 & 15.80\% & \texttt{tiny} \\
+\texttt{pycparser} & Pure Python & 10,448 & 8,176 & 6,917 & 6,564 & 353 & 5.10\% & \texttt{small} \\
+\texttt{colorama} & Pure Python & 17,347 & 16,612 & 9,093 & 8,511 & 582 & 6.40\% & \texttt{tiny} \\
+\texttt{markdown-it-py} & Pure Python & 15,633 & 14,261 & 7,744 & 5,704 & 2,040 & 26.34\% & \texttt{tiny} \\
+\texttt{lxml} & Win \texttt{amd64} & 106,073 & 78,926 & 69,665 & 68,914 & 751 & 1.08\% & \texttt{small-classic} \\
+\texttt{greenlet} & Win \texttt{amd64} & 13,576 & 12,504 & 7,062 & 6,376 & 686 & 9.71\% & \texttt{tiny} \\
+\texttt{contourpy} & Win \texttt{amd64} & 75,195 & 62,523 & 52,976 & 52,632 & 344 & 0.65\% & \texttt{data-pe} \\
+\texttt{rpds-py} & Win \texttt{amd64} & 233,779 & 74,342 & 62,074 & 61,938 & 136 & 0.22\% & \texttt{small-pe} \\
+\texttt{zstandard} & Win \texttt{amd64} & 235,969 & 178,882 & 157,400 & 157,101 & 299 & 0.19\% & \texttt{data-pe-prefix} \\
+\texttt{xxhash} & Win \texttt{amd64} & 22,640 & 19,628 & 14,579 & 14,319 & 260 & 1.78\% & \texttt{tiny} \\
+\texttt{multidict} & Win \texttt{amd64} & 7,612 & 6,589 & 4,109 & 3,891 & 218 & 5.31\% & \texttt{data-pe} \\
+\texttt{yarl} & Win \texttt{amd64} & 35,806 & 31,397 & 15,447 & 14,981 & 466 & 3.02\% & \texttt{data-pe} \\
+\midrule
+\textbf{All 16 projects} & \textbf{7 Py / 9 Win} & \textbf{888,127} & \textbf{611,442} & \textbf{441,126} & \textbf{431,406} & \textbf{9,720} & \textbf{2.20\%} & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-The ability to derive metadata depends on archive conventions and exact recompression. The 16 development projects offer limited coverage of codecs, platforms and release histories. Distribution at scale also depends on encoder time, decoder memory and codec availability. A fresh project cohort with fixed recipes and measured resource use would support a deployment claim.
+Deriving \texttt{RECORD} hashes reduced delivered patch size on all 16 of 16 projects, cutting the cohort total from 441,126 to 431,406 bytes (9,720 bytes saved, or 2.20\% beyond the preceding winners and 51.43\% below the 888,127-byte control). The largest absolute savings occurred in multi-file pure-Python distributions whose releases modify many modules and therefore rewrite many 43-byte digest rows: \texttt{setuptools} saved 2,593 bytes (15.50\%) and \texttt{markdown-it-py} saved 2,040 bytes (26.34\%). Smaller pure-Python packages also saw substantial relative reductions, including \texttt{certifi} (19.65\%), \texttt{sniffio} (15.80\%), and \texttt{wheel} (15.23\%). Conversely, large native wheels whose patch budgets are dominated by compiled C/Rust binaries saved fewer marginal bytes---\texttt{zstandard} saved 299 bytes (0.19\%), \texttt{rpds-py} saved 136 bytes (0.22\%), and \texttt{contourpy} saved 344 bytes (0.65\%)---while \texttt{lxml} and \texttt{greenlet}, which ship numerous Python and header files alongside native extensions, saved 751 bytes (1.08\%) and 686 bytes (9.71\%), respectively.
+
+Verification succeeded across every artifact: all 16 preceding patches matched their archived Round~2 SHA-256 hashes, all 16 winning derived-\texttt{RECORD} patches reproduced identical SHA-256 digests on a second encoding, and every decoded archive matched its published PyPI SHA-256 digest byte-for-byte. Independently regenerating the original sixteen archive-aware controls likewise reproduced all sixteen published wheels and the exact 888,127-byte baseline total.
+
+\paragraph{Limitations and open questions.}
+Three caveats bound these conclusions. First, the earlier Round~2 timed selector (464,911 bytes) measured a paired median encode time of $9.55\times$ (95\% bootstrap CI $[5.90, 11.69]$) and median decode time of $1.15\times$ (95\% CI $[0.98, 1.39]$) relative to the 888,127-byte control; those timings apply specifically to that selector, whereas the final size sweep and \texttt{RECORD} ablation are size-only evaluations and leave the wall-time cost of in-memory member hashing and deferred \texttt{RECORD} recompression unmeasured. Second, byte-exact reconstruction relies on archive conventions---canonical PEP~427 \texttt{RECORD} rows and exact DEFLATE bitstream reproduction by the pinned \texttt{zlib} or \texttt{miniz\_oxide} runtime---so wheels compressed with incompatible DEFLATE encoders fall back gracefully to literal retention. Third, the sixteen release pairs were reused across iterative development rounds and cover only pure-Python and Windows \texttt{amd64} wheels. Evaluating fixed recipes on a fresh held-out cohort across platforms, codecs, and measured CPU and memory budgets remains necessary to support a deployment claim.
+
+\paragraph{Code and data availability.}
+The \texttt{RECORD} transformation, \texttt{WDP3} patch preparation and two-pass decoder, archive normalization, PE normalization, and compact XZ stream codecs reside in \nolinkurl{workhorses/delta_record.py}, \nolinkurl{workhorses/delta_wheel.py}, \nolinkurl{workhorses/delta_archive.py}, \nolinkurl{workhorses/delta_pe.py}, \nolinkurl{workhorses/delta_xz.py}, and \nolinkurl{workhorses/delta_context.py}, with the Rust \texttt{miniz\_oxide} FFI wrapper in \nolinkurl{native/archive-codec/src/lib.rs} and focused unit tests in \nolinkurl{tests/test_delta.py}. The frozen PyPI manifest is stored in \nolinkurl{followup/inputs-delta.json}, the ablation and confirmation harness in \nolinkurl{benchmarks/record_wheels.py}, and the verified machine-readable summaries and archived journals in \nolinkurl{manuscripts/summary.json}, \nolinkurl{manuscripts/runs/wheels.jsonl}, \nolinkurl{manuscripts/runs/wheel-original.jsonl}, and \nolinkurl{twice/summary.json}.
+
+\begin{thebibliography}{9}
+\raggedright
+
+\bibitem{percival2003bsdiff}
+C.~Percival,
+\emph{Na\"{\i}ve differences of executable code},
+Technical report, 2003.
+\nolinkurl{https://www.daemonology.net/bsdiff/}
+
+\bibitem{archivepatcher}
+Google,
+\emph{Archive Patcher: space-efficient patching of compressed archives},
+GitHub repository.
+\nolinkurl{https://github.com/google/archive-patcher}
+
+\bibitem{pep427}
+Python Packaging Authority (PyPA),
+\emph{Binary distribution format (PEP~427 Wheel specification)},
+Python Packaging User Guide.
+\nolinkurl{https://packaging.python.org/en/latest/specifications/binary-distribution-format/}
+
+\bibitem{rfc1951}
+P.~Deutsch,
+\emph{DEFLATE Compressed Data Format Specification version~1.3},
+IETF RFC~1951, May 1996.
+\nolinkurl{https://www.rfc-editor.org/rfc/rfc1951}
+
+\bibitem{zlib}
+J.-l.~Gailly and M.~Adler,
+\emph{zlib compression library}.
+\nolinkurl{https://zlib.net/}
+
+\bibitem{minizoxide}
+Frommi and contributors,
+\emph{\texttt{miniz\_oxide}: DEFLATE compression and decompression library in pure Rust (v0.8.2)},
+GitHub repository.
+\nolinkurl{https://github.com/Frommi/miniz_oxide}
+
+\bibitem{peformat}
+Microsoft,
+\emph{PE Format: The \texttt{.pdata} Section},
+Windows Win32 Documentation.
+\nolinkurl{https://learn.microsoft.com/en-us/windows/win32/debug/pe-format}
+
+\bibitem{xzformat}
+L.~Collin and I.~Pavlov,
+\emph{The \texttt{.xz} File Format},
+Tukaani Project.
+\nolinkurl{https://tukaani.org/xz/xz-file-format.txt}
+
+\end{thebibliography}
 
 \end{document}

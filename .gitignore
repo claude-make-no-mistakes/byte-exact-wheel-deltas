@@ -3,3 +3,10 @@ __pycache__/
 *.py[cod]
 /.venv/
 /repositories/
+*.aux
+*.log
+*.out
+*.fls
+*.fdb_latexmk
+*.toc
+*.synctex.gz
